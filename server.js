@@ -70,12 +70,12 @@ app.listen(3000, () => console.log("Server running"));
 
 app.get("/clips", async (req, res) => {
   try {
-    await ensureToken();
+    await ensureToken(); // 🔥 THIS IS CRITICAL
 
     const response = await fetch("https://api.twitch.tv/helix/clips?broadcaster_id=YOUR_USER_ID&first=6", {
       headers: {
         "Client-ID": CLIENT_ID,
-        "Authorization": `Bearer ${accessToken}`
+        "Authorization": `Bearer ${accessToken}` // 🔥 MUST include token
       }
     });
 
@@ -83,6 +83,7 @@ app.get("/clips", async (req, res) => {
     res.json(data);
 
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Failed to fetch clips" });
   }
 });
