@@ -1,13 +1,17 @@
 import express from "express";
 import fetch from "node-fetch";
+import http from "http";
+import { Server } from "socket.io";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
-import axios from "axios";
 
 const app = express();
 app.use(express.json());
 
+// ======================
 // ENV
+// ======================
+
 const CLIENT_ID = process.env.TWITCH_CLIENT_ID;
 const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
 
@@ -18,6 +22,30 @@ const supabase = createClient(
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
+});
+
+// ======================
+// SOCKET.IO SETUP
+// ======================
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*"
+  }
+});
+
+function broadcast(event, data) {
+  io.emit(event, data);
+}
+
+io.on("connection", (socket) => {
+  console.log("Client connected:", socket.id);
+
+  socket.emit("status", {
+    message: "PulsePlay live connected 🔥"
+  });
 });
 
 // ======================
@@ -45,7 +73,48 @@ async function ensureToken() {
 }
 
 // ======================
-// HEALTH CHECK
+// AI SCORING
+// ======================
+
+async function scoreClip(title, views) {
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "user",
+        content: `
+Rate virality 1-100.
+
+Title: ${title}
+Views: ${views}
+
+Return ONLY JSON:
+{"score": number}
+        `
+      }
+    ]
+  });
+
+  const raw = completion.choices[0].message.content;
+  return JSON.parse(raw).score;
+}
+
+// ======================
+// VIRAL CHECK
+// ======================
+
+function checkViral(clip) {
+  if (clip.score >= 85) {
+    broadcast("viral_alert", {
+      title: clip.title,
+      score: clip.score,
+      message: "🔥 VIRAL CLIP DETECTED"
+    });
+  }
+}
+
+// ======================
+// HOME
 // ======================
 
 app.get("/", (req, res) => {
@@ -53,37 +122,7 @@ app.get("/", (req, res) => {
 });
 
 // ======================
-// AUTH SYSTEM
-// ======================
-
-app.post("/signup", async (req, res) => {
-  const { email } = req.body;
-
-  const { error } = await supabase
-    .from("users")
-    .insert([{ email }]);
-
-  if (error) return res.status(400).json(error);
-
-  res.json({ success: true });
-});
-
-app.post("/login", async (req, res) => {
-  const { email } = req.body;
-
-  const { data } = await supabase
-    .from("users")
-    .select("*")
-    .eq("email", email)
-    .single();
-
-  if (!data) return res.status(404).json({ error: "User not found" });
-
-  res.json({ success: true });
-});
-
-// ======================
-// TWITCH CLIPS
+// MAIN CLIP PIPELINE
 // ======================
 
 app.get("/clips", async (req, res) => {
@@ -115,127 +154,54 @@ app.get("/clips", async (req, res) => {
 
     const clips = await clipRes.json();
 
-    res.json(clips);
-  } catch (err) {
-    console.log(err);
-    res.status(500).json({ error: "clips failed" });
-  }
-});
+    const processed = [];
 
-// ======================
-// ANALYTICS
-// ======================
+    for (const clip of clips.data) {
+      const score = await scoreClip(clip.title, clip.view_count);
 
-app.get("/analytics", async (req, res) => {
-  try {
-    await ensureToken();
+      // SAVE TO SUPABASE
+      await supabase.from("clips").upsert({
+        twitch_clip_id: clip.id,
+        title: clip.title,
+        url: clip.url,
+        views: clip.view_count,
+        creator: clip.creator_name,
+        ai_score: score
+      });
 
-    const response = await fetch(
-      "https://api.twitch.tv/helix/streams?user_login=veiltactician",
-      {
-        headers: {
-          "Client-ID": CLIENT_ID,
-          Authorization: `Bearer ${token}`
-        }
-      }
-    );
+      const clipData = {
+        id: clip.id,
+        title: clip.title,
+        views: clip.view_count,
+        score
+      };
 
-    const data = await response.json();
+      // 🚀 REAL-TIME UPDATE
+      broadcast("clip_scored", clipData);
+
+      // 🔥 VIRAL CHECK
+      checkViral(clipData);
+
+      processed.push(clipData);
+    }
 
     res.json({
-      live: data.data.length > 0,
-      stream: data.data[0] || null
-    });
-  } catch {
-    res.status(500).json({ error: "analytics failed" });
-  }
-});
-
-// ======================
-// AI CLIP SCORING
-// ======================
-
-app.post("/score-clip", async (req, res) => {
-  try {
-    const { title, views } = req.body;
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "user",
-          content: `
-Rate virality 1-100.
-
-Title: ${title}
-Views: ${views}
-
-Return ONLY JSON:
-{"score": number, "reason": string}
-          `
-        }
-      ]
+      success: true,
+      clips: processed
     });
 
-    const text = completion.choices[0].message.content;
-    const result = JSON.parse(text);
-
-    res.json(result);
   } catch (err) {
     console.log(err);
-    res.status(500).json({ error: "AI scoring failed" });
+    res.status(500).json({ error: "pipeline failed" });
   }
 });
 
 // ======================
-// LEADERBOARD
-// ======================
-
-app.get("/leaderboard", async (req, res) => {
-  const { data, error } = await supabase
-    .from("leaderboard")
-    .select("*")
-    .order("points", { ascending: false })
-    .limit(10);
-
-  if (error) return res.status(500).json(error);
-
-  res.json(data);
-});
-
-// ======================
-// TIKTOK (OPTIONAL HOOK)
-// ======================
-
-app.post("/post-tiktok", async (req, res) => {
-  try {
-    const { videoUrl, caption } = req.body;
-
-    const response = await axios.post(
-      "https://open.tiktokapis.com/v2/post/publish/",
-      {
-        video_url: videoUrl,
-        caption
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.TIKTOK_TOKEN}`
-        }
-      }
-    );
-
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: "TikTok post failed" });
-  }
-});
-
-// ======================
-// START SERVER
+// SERVER START
 // ======================
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log("PulsePlay running on port", PORT);
 });

@@ -169,7 +169,26 @@ async function load() {
 
 load();
 setInterval(load, 60000);
-</script>
+</script>    
 
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+<script>
+  const socket = io("https://https://pulseplay-redo1-ibc3.onrender.com");
+
+  socket.on("status", (data) => {
+    console.log(data.message);
+  });
+
+  socket.on("clip_scored", (clip) => {
+    console.log("NEW CLIP:", clip);
+
+    // update dashboard UI here
+  });
+
+  socket.on("viral_alert", (data) => {
+    alert("🔥 VIRAL CLIP: " + data.title);
+  });
+</script>
 </body>
 </html>
