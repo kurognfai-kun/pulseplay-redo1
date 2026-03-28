@@ -1,6 +1,8 @@
 import express from "express";
 import fetch from "node-fetch";
 import http from "http";
+import path from "path";
+import { fileURLToPath } from "url";
 import { Server } from "socket.io";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
@@ -9,9 +11,14 @@ const app = express();
 app.use(express.json());
 
 // ======================
+// PATH FIX (IMPORTANT)
+// ======================
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ======================
 // ENV
 // ======================
-
 const CLIENT_ID = process.env.TWITCH_CLIENT_ID;
 const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
 
@@ -25,33 +32,30 @@ const openai = new OpenAI({
 });
 
 // ======================
-// SOCKET.IO SETUP
+// SERVER + SOCKET
 // ======================
-
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: "*"
-  }
+  cors: { origin: "*" }
 });
 
 function broadcast(event, data) {
   io.emit(event, data);
 }
 
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
+// ======================
+// STATIC FRONTEND
+// ======================
+app.use(express.static("public"));
 
-  socket.emit("status", {
-    message: "PulsePlay live connected 🔥"
-  });
+app.get("/dashboard", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 // ======================
 // TWITCH AUTH
 // ======================
-
 let token = "";
 let expiry = 0;
 
@@ -75,7 +79,6 @@ async function ensureToken() {
 // ======================
 // AI SCORING
 // ======================
-
 async function scoreClip(title, views) {
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -83,7 +86,7 @@ async function scoreClip(title, views) {
       {
         role: "user",
         content: `
-Rate virality 1-100.
+Score virality 1-100.
 
 Title: ${title}
 Views: ${views}
@@ -102,7 +105,6 @@ Return ONLY JSON:
 // ======================
 // VIRAL CHECK
 // ======================
-
 function checkViral(clip) {
   if (clip.score >= 85) {
     broadcast("viral_alert", {
@@ -116,15 +118,13 @@ function checkViral(clip) {
 // ======================
 // HOME
 // ======================
-
 app.get("/", (req, res) => {
   res.json({ status: "PulsePlay API running 🚀" });
 });
 
 // ======================
-// MAIN CLIP PIPELINE
+// CLIPS PIPELINE
 // ======================
-
 app.get("/clips", async (req, res) => {
   try {
     await ensureToken();
@@ -159,7 +159,6 @@ app.get("/clips", async (req, res) => {
     for (const clip of clips.data) {
       const score = await scoreClip(clip.title, clip.view_count);
 
-      // SAVE TO SUPABASE
       await supabase.from("clips").upsert({
         twitch_clip_id: clip.id,
         title: clip.title,
@@ -176,19 +175,16 @@ app.get("/clips", async (req, res) => {
         score
       };
 
-      // 🚀 REAL-TIME UPDATE
+      // REAL-TIME UPDATE
       broadcast("clip_scored", clipData);
 
-      // 🔥 VIRAL CHECK
+      // VIRAL ALERT
       checkViral(clipData);
 
       processed.push(clipData);
     }
 
-    res.json({
-      success: true,
-      clips: processed
-    });
+    res.json({ success: true, clips: processed });
 
   } catch (err) {
     console.log(err);
@@ -199,7 +195,6 @@ app.get("/clips", async (req, res) => {
 // ======================
 // SERVER START
 // ======================
-
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () => {
