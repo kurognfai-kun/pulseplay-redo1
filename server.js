@@ -1,202 +1,235 @@
 import express from "express";
-import fetch from "node-fetch";
 import http from "http";
-import path from "path";
-import { fileURLToPath } from "url";
 import { Server } from "socket.io";
+import cors from "cors";
+import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 
+dotenv.config();
+
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+app.use(cors());
 app.use(express.json());
+app.use(express.static("public"));
 
-// ======================
-// PATH FIX (IMPORTANT)
-// ======================
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ======================
-// ENV
-// ======================
-const CLIENT_ID = process.env.TWITCH_CLIENT_ID;
-const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
-
+/* =========================
+   🔐 CONFIG
+========================= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_KEY
 );
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// ======================
-// SERVER + SOCKET
-// ======================
-const server = http.createServer(app);
+const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
+const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
 
-const io = new Server(server, {
-  cors: { origin: "*" }
-});
+let twitchToken = "";
+let twitchExpiry = 0;
 
-function broadcast(event, data) {
-  io.emit(event, data);
-}
+/* =========================
+   🔥 TWITCH TOKEN
+========================= */
+async function getTwitchToken() {
+  if (twitchToken && Date.now() < twitchExpiry) return twitchToken;
 
-// ======================
-// STATIC FRONTEND
-// ======================
-app.use(express.static("public"));
-
-app.get("/dashboard", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
-// ======================
-// TWITCH AUTH
-// ======================
-let token = "";
-let expiry = 0;
-
-async function getToken() {
   const res = await fetch(
-    `https://id.twitch.tv/oauth2/token?client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&grant_type=client_credentials`,
+    `https://id.twitch.tv/oauth2/token?client_id=${TWITCH_CLIENT_ID}&client_secret=${TWITCH_CLIENT_SECRET}&grant_type=client_credentials`,
     { method: "POST" }
   );
 
   const data = await res.json();
-  token = data.access_token;
-  expiry = Date.now() + data.expires_in * 1000;
+
+  twitchToken = data.access_token;
+  twitchExpiry = Date.now() + (data.expires_in * 1000);
+
+  console.log("🔥 Twitch token refreshed");
+  return twitchToken;
 }
 
-async function ensureToken() {
-  if (!token || Date.now() >= expiry) {
-    await getToken();
-  }
-}
+/* =========================
+   📥 TWITCH AUTO INGEST
+========================= */
+async function fetchTwitchClips() {
+  try {
+    const token = await getTwitchToken();
 
-// ======================
-// AI SCORING
-// ======================
-async function scoreClip(title, views) {
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
+    const res = await fetch(
+      "https://api.twitch.tv/helix/users?login=VeilTactician",
       {
-        role: "user",
-        content: `
-Score virality 1-100.
-
-Title: ${title}
-Views: ${views}
-
-Return ONLY JSON:
-{"score": number}
-        `
+        headers: {
+          "Client-ID": TWITCH_CLIENT_ID,
+          "Authorization": `Bearer ${token}`
+        }
       }
-    ]
-  });
+    );
 
-  const raw = completion.choices[0].message.content;
-  return JSON.parse(raw).score;
-}
+    const json = await res.json();
 
-// ======================
-// VIRAL CHECK
-// ======================
-function checkViral(clip) {
-  if (clip.score >= 85) {
-    broadcast("viral_alert", {
-      title: clip.title,
-      score: clip.score,
-      message: "🔥 VIRAL CLIP DETECTED"
-    });
+    for (const clip of json.data || []) {
+      const title = clip.title;
+      const views = clip.view_count;
+
+      // prevent duplicates
+      const { data: existing } = await supabase
+        .from("clips")
+        .select("id")
+        .eq("title", title)
+        .limit(1);
+
+      if (existing && existing.length > 0) continue;
+
+      // 🤖 AI SCORE
+      const ai = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: "Return ONLY a number 0-100." },
+          { role: "user", content: title }
+        ]
+      });
+
+      const score = parseInt(
+        ai.choices[0].message.content.match(/\d+/)?.[0] || "0"
+      );
+
+      // 💾 SAVE
+      const { data } = await supabase
+        .from("clips")
+        .insert([
+          {
+            title,
+            views,
+            score,
+            ready_for_post: score >= 85
+          }
+        ])
+        .select();
+
+      const saved = data[0];
+
+      io.emit("clip_scored", saved);
+
+      if (score >= 85) {
+        io.emit("viral_alert", saved);
+      }
+    }
+  } catch (err) {
+    console.error("Twitch ingest error:", err);
   }
 }
 
-// ======================
-// HOME
-// ======================
+/* AUTO RUN */
+setInterval(fetchTwitchClips, 60000);
+
+/* =========================
+   🚀 ROUTES
+========================= */
 app.get("/", (req, res) => {
   res.json({ status: "PulsePlay API running 🚀" });
 });
 
-// ======================
-// CLIPS PIPELINE
-// ======================
+/* GET CLIPS */
 app.get("/clips", async (req, res) => {
+  const { data } = await supabase
+    .from("clips")
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  res.json({ clips: data });
+});
+
+/* CREATE CLIP */
+app.post("/clips", async (req, res) => {
   try {
-    await ensureToken();
+    const { title, views, user_id } = req.body;
 
-    const userRes = await fetch(
-      "https://api.twitch.tv/helix/users?login=veiltactician",
-      {
-        headers: {
-          "Client-ID": CLIENT_ID,
-          Authorization: `Bearer ${token}`
-        }
-      }
+    const ai = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: "Return ONLY a number 0-100." },
+        { role: "user", content: title }
+      ]
+    });
+
+    const score = parseInt(
+      ai.choices[0].message.content.match(/\d+/)?.[0] || "0"
     );
 
-    const userData = await userRes.json();
-    const userId = userData.data[0].id;
+    const { data } = await supabase
+      .from("clips")
+      .insert([{ title, views, score, user_id }])
+      .select();
 
-    const clipRes = await fetch(
-      `https://api.twitch.tv/helix/clips?broadcaster_id=${userId}&first=6`,
-      {
-        headers: {
-          "Client-ID": CLIENT_ID,
-          Authorization: `Bearer ${token}`
-        }
-      }
-    );
+    const clip = data[0];
 
-    const clips = await clipRes.json();
+    io.emit("clip_scored", clip);
 
-    const processed = [];
+    res.json({ clip });
 
-    for (const clip of clips.data) {
-      const score = await scoreClip(clip.title, clip.view_count);
-
-      await supabase.from("clips").upsert({
-        twitch_clip_id: clip.id,
-        title: clip.title,
-        url: clip.url,
-        views: clip.view_count,
-        creator: clip.creator_name,
-        ai_score: score
-      });
-
-      const clipData = {
-        id: clip.id,
-        title: clip.title,
-        views: clip.view_count,
-        score
-      };
-
-      // REAL-TIME UPDATE
-      broadcast("clip_scored", clipData);
-
-      // VIRAL ALERT
-      checkViral(clipData);
-
-      processed.push(clipData);
-    }
-
-    res.json({ success: true, clips: processed });
-
-  } catch (err) {
-    console.log(err);
-    res.status(500).json({ error: "pipeline failed" });
+  } catch {
+    res.status(500).json({ error: "Failed to create clip" });
   }
 });
 
-// ======================
-// SERVER START
-// ======================
-const PORT = process.env.PORT || 3000;
+/* AI PREDICT */
+app.post("/predict", async (req, res) => {
+  const { title } = req.body;
 
+  const ai = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      { role: "system", content: 'Return JSON {"score":number,"tips":"tip"}' },
+      { role: "user", content: title }
+    ]
+  });
+
+  let result;
+  try {
+    result = JSON.parse(ai.choices[0].message.content);
+  } catch {
+    result = { score: 50, tips: "Make it more engaging." };
+  }
+
+  res.json(result);
+});
+
+/* ANALYTICS */
+app.get("/analytics/:user_id", async (req, res) => {
+  const { data } = await supabase
+    .from("clips")
+    .select("score, views, created_at")
+    .eq("user_id", req.params.user_id)
+    .order("created_at", { ascending: true });
+
+  res.json({ data });
+});
+
+/* POST TO TIKTOK (SIMULATED) */
+app.post("/post-to-tiktok", async (req, res) => {
+  const { clip_id } = req.body;
+
+  await supabase
+    .from("clips")
+    .update({ ready_for_post: false })
+    .eq("id", clip_id);
+
+  res.json({ success: true });
+});
+
+/* SOCKET */
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+});
+
+/* START */
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log("PulsePlay running on port", PORT);
+  console.log("🚀 Running on port", PORT);
 });
