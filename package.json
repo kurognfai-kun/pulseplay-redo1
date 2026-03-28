@@ -1,7 +1,7 @@
 {
-  "name": "pulseplay-site",
+  "name": "pulseplay-api",
   "version": "1.0.0",
-  "description": "PulsePlay Twitch site",
+  "description": "PulsePlay SaaS Backend",
   "main": "server.js",
   "type": "module",
   "scripts": {
