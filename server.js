@@ -1,10 +1,9 @@
-
 import express from "express";
 
 const app = express();
 
 /* 🔥 FORCE LOG */
-console.log("🔥 FORCE DEPLOY VERSION 3");
+console.log("🔥 SERVER FILE LOADED CORRECTLY");
 
 /* 🔥 TEST ROUTE */
 app.get("/test", (req, res) => {
