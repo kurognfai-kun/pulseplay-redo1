@@ -164,6 +164,10 @@ app.get("/", (req, res) => {
   res.json({ status: "PulsePlay API running 🚀" });
 });
 
+app.get("/", (req, res) => {
+  res.json({ status: "🔥 NEW VERSION LIVE 🔥" });
+});
+
 /* GET CLIPS */
 app.get("/clips", async (req, res) => {
   const { data } = await supabase
